@@ -1,8 +1,8 @@
 # hop
 
-A tiny keyboard launcher for Windows. Press **Alt+Space**, type, press Enter. One box opens apps,
+A tiny keyboard launcher for Windows. Press **`` Win+` ``** (the key above Tab), type, press Enter. One box opens apps,
 finds files (through [Voidtools Everything](https://www.voidtools.com/)), does arithmetic, runs
-commands and searches the web. It's one native ~370 KB executable with no runtime, no installer, no
+commands and searches the web. It's one native ~380 KB executable with no runtime, no installer, no
 plugins and no telemetry.
 
 ![hop, dark theme](docs/screenshot-dark.png)
@@ -10,6 +10,7 @@ plugins and no telemetry.
 | | |
 | --- | --- |
 | ![A calculation](docs/screenshot-calc.png) | ![A command](docs/screenshot-command.png) |
+| ![First run: tips in the empty box](docs/screenshot-tips.png) | ![Light theme](docs/screenshot-light.png) |
 
 ## Features
 
@@ -17,7 +18,11 @@ plugins and no telemetry.
   Matches are ranked the way you'd expect: the exact name first, then a prefix (`note` → Notepad),
   then a word start (`code` → Visual Studio Code), then an acronym (`vsc`), then a substring, then
   letters in order (`vscode`). Apps you launch often move up.
-- **Recent apps.** Open the box without typing and it lists what you launched last.
+- **Recent apps.** Open the box without typing and it lists what you launched last. Before you've
+  launched anything, it shows examples to try instead.
+- **Easy to scan.** Results are grouped under Apps, Files, Calculator and Web. Paths in your profile
+  are shortened to `~\...`. Programs and shortcuts show their own icons, and the footer shows what
+  each key does for the selected row.
 - **Files.** If Everything is running, file results appear below the apps as you type. hop leaves out
   places tools fill up (dot-folders, AppData, node_modules, site-packages, Windows, the Recycle Bin).
   It fetches the 100 newest matches and puts your own files first: Desktop, Documents, Downloads,
@@ -33,7 +38,7 @@ plugins and no telemetry.
 
 | Key | Action |
 | --- | --- |
-| `Alt+Space` | Show or hide hop (change it with `--hotkey`) |
+| `` Win+` `` | Show or hide hop (change it with `--hotkey`) |
 | `Up` / `Down`, `PgUp` / `PgDn` | Move the selection |
 | `Enter` | Open the app or file, copy the result, run the command, search |
 | `Ctrl+Enter` | Show the file, or the app's program file, in Explorer |
@@ -58,14 +63,16 @@ Options:
 
 ```text
 hop.exe --hidden              start without popping up (Start with Windows uses this)
-hop.exe --hotkey <combo>      global hotkey, e.g. Ctrl+Space, Win+Shift+Space, Alt+F1 (default Alt+Space)
+hop.exe --hotkey <combo>      global hotkey, e.g. Ctrl+Alt+H, Win+Shift+K, Alt+F1 (default Win+`)
 hop.exe --instance <name>     target a named Everything instance (default: the 1.4 instance, then "1.5a")
 hop.exe --theme light|dark    override the system theme
 ```
 
-Global hotkeys go to whichever app registers them first. PowerToys Run and Flow Launcher also use
-Alt+Space. If one of them is running, hop says so at startup. Pick another combo, e.g.
-`hop.exe --hotkey Ctrl+Space`. To keep it at sign-in, edit the `hop` value under
+The default hotkey is **`` Win+` ``**. Windows doesn't reserve it, and apps don't use Win-key shortcuts,
+so it never takes a key away from an app. Ctrl+Space would break autocomplete in editors, and
+Alt+Space is the window menu (and PowerToys Run). Global hotkeys go to whichever app registers them
+first, so if something already holds `` Win+` ``, hop falls back to Win+Shift+K, then Ctrl+Alt+K. The
+right-click menu shows which one it got. To choose your own, e.g. `hop.exe --hotkey Ctrl+Alt+H`, and to keep it at sign-in, edit the `hop` value under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, or add the flag to a shortcut in `shell:startup`.
 
 hop keeps one file, `%APPDATA%\hop\history.txt`: how often and when you launched each app. Delete it
@@ -131,7 +138,7 @@ word, so `resume` doesn't match "Solitai**re** & Ca**su**al Ga**me**s".
 Flow registers its hotkey through NHotkey (`RegisterHotKey`). It uses a separate library, ChefKeys,
 for Win-key-only hotkeys: ChefKeys installs a `WH_KEYBOARD_LL` hook and injects a dummy key with
 `keybd_event` so the Start menu doesn't open. hop uses plain `RegisterHotKey` with `MOD_NOREPEAT`, and
-needs no hook. To take the foreground, it calls `SetForegroundWindow` and falls back to
+needs no hook. The default, `` Win+` ``, is a combination Windows doesn't reserve and apps don't use. To take the foreground, it calls `SetForegroundWindow` and falls back to
 `AttachThreadInput` (the same approach as evbar).
 
 ### Files: Everything over WM_COPYDATA

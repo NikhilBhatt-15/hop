@@ -7,10 +7,11 @@ pub const MOD_CONTROL: u32 = 0x2;
 pub const MOD_SHIFT: u32 = 0x4;
 pub const MOD_WIN: u32 = 0x8;
 
-/// Alt+Space: the launcher convention (PowerToys Run, Flow Launcher).
-/// RegisterHotKey takes it over from the window menu. If PowerToys Run or
-/// Flow already holds it, registration fails and hop says so.
-pub const DEFAULT: &str = "Alt+Space";
+/// Tried in order until one registers. Win+` comes first: Windows doesn't
+/// reserve it, and apps don't use Win shortcuts, so it never steals a key an
+/// app needs (unlike Ctrl+Space, autocomplete in editors, or Alt+Space, the
+/// window menu and PowerToys Run).
+pub const DEFAULTS: &[&str] = &["Win+`", "Win+Shift+K", "Ctrl+Alt+K"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hotkey {
@@ -91,7 +92,7 @@ mod tests {
         assert_eq!(parse("ctrl + shift + f"), Ok(Hotkey { modifiers: MOD_CONTROL | MOD_SHIFT, vk: b'F' as u32 }));
         assert_eq!(parse("Alt+F12"), Ok(Hotkey { modifiers: MOD_ALT, vk: 0x7B }));
         assert_eq!(parse("Win+`"), Ok(Hotkey { modifiers: MOD_WIN, vk: 0xC0 }));
-        assert!(parse(DEFAULT).is_ok());
+        assert!(DEFAULTS.iter().all(|d| parse(d).is_ok()));
     }
 
     #[test]

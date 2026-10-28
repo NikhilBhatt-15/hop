@@ -64,17 +64,20 @@ const RENDER_TIMER: usize = 1;
 /// Apps shown for a query, and recent apps shown in the empty box.
 const MAX_APPS: usize = 6;
 const MAX_RECENT: usize = 6;
-const VISIBLE_ROWS: i32 = 8;
 const REINDEX_AFTER: Duration = Duration::from_secs(120);
 const FILE_FLAGS: u32 = request::FILE_NAME | request::PATH | request::HIGHLIGHTED_FILE_NAME;
 
 // Layout in 96-DPI pixels.
-const WIDTH: i32 = 640;
-const BOX_H: i32 = 56;
-const ROW_H: i32 = 52;
+const WIDTH: i32 = 680;
+const BOX_H: i32 = 60;
+const ROW_H: i32 = 50;
+const HEADER_H: i32 = 28;
+/// The list scrolls beyond this height: about eight result rows.
+const LIST_MAX_H: i32 = 420;
 const PAD: i32 = 6;
-const FOOTER_H: i32 = 30;
+const FOOTER_H: i32 = 38;
 const ICON: i32 = 32;
+const KEYCAP_H: i32 = 20;
 
 const EM_SETSEL: u32 = 0x00B1;
 const EM_GETSEL: u32 = 0x00B0;
@@ -92,6 +95,17 @@ const GLYPH_CALC: u16 = 0xE8EF;
 const GLYPH_COMMAND: u16 = 0xE756;
 const GLYPH_GLOBE: u16 = 0xE774;
 const GLYPH_APP: u16 = 0xE71D;
+const GLYPH_BULB: u16 = 0xE82F;
+
+/// Shown in the empty box until there is launch history. Choosing one types
+/// the example in, so the user sees what it does.
+const TIPS: &[(&str, &str)] = &[
+    ("notepad", "Type part of an app's name to open it"),
+    ("report pdf", "Find files by name (with Everything running)"),
+    ("24*18+7", "Do math. Enter copies the result"),
+    ("> ipconfig", "Start with > to run a command"),
+    ("www.github.com", "Open a website, or search the web for anything"),
+];
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -103,7 +117,9 @@ struct Theme {
     border: COLORREF,
     text: COLORREF,
     dim: COLORREF,
+    hover: COLORREF,
     sel: COLORREF,
+    key: COLORREF,
     accent: COLORREF,
 }
 
@@ -111,20 +127,24 @@ impl Theme {
     fn current(force_light: Option<bool>) -> Theme {
         if force_light.unwrap_or_else(system_uses_light_theme) {
             Theme {
-                bg: rgb(251, 251, 251),
-                border: rgb(214, 214, 214),
+                bg: rgb(250, 250, 250),
+                border: rgb(218, 218, 218),
                 text: rgb(26, 26, 26),
-                dim: rgb(96, 96, 96),
-                sel: rgb(234, 234, 234),
+                dim: rgb(104, 104, 104),
+                hover: rgb(241, 241, 241),
+                sel: rgb(232, 232, 232),
+                key: rgb(255, 255, 255),
                 accent: rgb(0, 95, 184),
             }
         } else {
             Theme {
-                bg: rgb(43, 43, 43),
-                border: rgb(70, 70, 70),
+                bg: rgb(39, 39, 39),
+                border: rgb(66, 66, 66),
                 text: rgb(242, 242, 242),
-                dim: rgb(166, 166, 166),
-                sel: rgb(61, 61, 61),
+                dim: rgb(160, 160, 160),
+                hover: rgb(49, 49, 49),
+                sel: rgb(58, 58, 58),
+                key: rgb(52, 52, 52),
                 accent: rgb(96, 205, 255),
             }
         }
@@ -167,6 +187,9 @@ enum FileStatus {
 }
 
 enum Row {
+    /// A section title; never selected.
+    Header(&'static str),
+    Tip(usize),
     Calc(f64),
     App { idx: usize, positions: Vec<usize> },
     File(usize),
@@ -174,11 +197,24 @@ enum Row {
     Web(String),
 }
 
+impl Row {
+    fn selectable(&self) -> bool {
+        !matches!(self, Row::Header(_))
+    }
+
+    fn height(&self) -> i32 {
+        scale(if self.selectable() { ROW_H } else { HEADER_H })
+    }
+}
+
 struct Fonts {
     edit: HFONT,
     name: HFONT,
     name_bold: HFONT,
+    result: HFONT,
     small: HFONT,
+    header: HFONT,
+    key: HFONT,
     glyph: HFONT,
     glyph_big: HFONT,
 }
@@ -194,11 +230,13 @@ struct App {
     indexed_at: Option<Instant>,
     indexing: bool,
     history: History,
+    profile: String,
     query: String,
     rows: Vec<Row>,
     files: Vec<Item>,
     file_status: FileStatus,
     sel: i32,
+    /// Scroll offset of the list, in pixels.
     scroll: i32,
     hover: i32,
     tracking_mouse: bool,
@@ -207,7 +245,9 @@ struct App {
     /// App icons by id, at the current DPI.
     app_icons: HashMap<String, HBITMAP>,
     image_list: isize,
-    ext_icons: HashMap<String, i32>,
+    /// System image list indexes by extension, or by full path for files
+    /// whose icon is their own (.exe, .lnk...).
+    file_icons: HashMap<String, i32>,
     hotkey: Option<String>,
     force_light: Option<bool>,
     render: Option<RenderJob>,
@@ -224,7 +264,8 @@ struct Options {
     instance: Option<String>,
     force_light: Option<bool>,
     render: Option<RenderJob>,
-    hotkey: String,
+    /// `--hotkey`; without it hop takes the first free one of `hotkey::DEFAULTS`.
+    hotkey: Option<String>,
     start_hidden: bool,
 }
 
@@ -265,7 +306,7 @@ fn parse_args() -> Options {
     Options {
         instance: value("--instance", 1),
         force_light: value("--theme", 1).map(|t| t == "light"),
-        hotkey: value("--hotkey", 1).unwrap_or_else(|| hotkey::DEFAULT.to_string()),
+        hotkey: value("--hotkey", 1),
         start_hidden: args.iter().any(|a| a == "--hidden"),
         render: value("--render", 1).zip(value("--render", 2)).map(|(query, out)| RenderJob { query, out }),
     }
@@ -284,6 +325,7 @@ unsafe fn run(opts: Options) {
         indexed_at: None,
         indexing: false,
         history: if opts.render.is_some() { History::default() } else { History::load_default() },
+        profile: std::env::var("USERPROFILE").unwrap_or_default(),
         query: String::new(),
         rows: Vec::new(),
         files: Vec::new(),
@@ -296,7 +338,7 @@ unsafe fn run(opts: Options) {
         worker: worker.clone(),
         app_icons: HashMap::new(),
         image_list: 0,
-        ext_icons: HashMap::new(),
+        file_icons: HashMap::new(),
         hotkey: None,
         force_light: opts.force_light,
         render: opts.render,
@@ -360,13 +402,27 @@ unsafe fn run(opts: Options) {
         a.indexed_at = Some(Instant::now());
         SetTimer(a.hwnd, RENDER_TIMER, 1500, None);
         let q = job.query.clone();
-        SetWindowTextW(a.edit, wide(&q).as_ptr()); // EN_CHANGE runs the query
+        if q.is_empty() {
+            on_text_changed(); // the empty box: recent apps or tips
+        } else {
+            SetWindowTextW(a.edit, wide(&q).as_ptr()); // EN_CHANGE runs the query
+        }
         if a.file_status != FileStatus::Pending {
             render_and_quit();
         }
     } else {
         reindex();
-        register_hotkey(&opts.hotkey);
+        match &opts.hotkey {
+            Some(spec) => {
+                register_hotkey(spec, true);
+            }
+            None => {
+                // The first default nobody else holds.
+                if !hotkey::DEFAULTS.iter().any(|spec| register_hotkey(spec, false)) {
+                    register_hotkey(hotkey::DEFAULTS[0], true);
+                }
+            }
+        }
         // Pop up once on a manual launch so it is obvious hop started;
         // --hidden (for autostart) skips that.
         if !opts.start_hidden {
@@ -382,28 +438,35 @@ unsafe fn run(opts: Options) {
 }
 
 /// Registers the global hotkey. Another app may already own the combination
-/// (RegisterHotKey is first come, first served), so say so instead of
-/// failing silently.
-unsafe fn register_hotkey(spec: &str) {
+/// (RegisterHotKey is first come, first served); with `report`, say so
+/// instead of failing silently.
+unsafe fn register_hotkey(spec: &str, report: bool) -> bool {
     let a = app();
     let problem = match hotkey::parse(spec) {
         Err(e) => Some(format!("The hotkey {e}.")),
         Ok(hk) => {
             if RegisterHotKey(a.hwnd, HOTKEY_ID, hk.modifiers | MOD_NOREPEAT, hk.vk) != 0 {
                 a.hotkey = Some(spec.to_string());
-                None
-            } else {
-                Some(format!(
-                    "{spec} is already used by another app (PowerToys Run and Flow Launcher use Alt+Space), so hop can't use it."
-                ))
+                return true;
             }
+            Some(format!("{spec} is already used by another app, so hop can't use it."))
         }
     };
-    if let Some(problem) = problem {
+    if let (Some(problem), true) = (problem, report) {
         let text = format!(
-            "{problem}\n\nRun hop.exe again to open it, or restart it with a different hotkey, e.g.\n\n    hop.exe --hotkey Ctrl+Space"
+            "{problem}\n\nRun hop.exe again to open it, or restart it with a different hotkey, e.g.\n\n    hop.exe --hotkey Ctrl+Alt+H"
         );
         MessageBoxW(a.hwnd, wide(&text).as_ptr(), wide("hop").as_ptr(), MB_OK | MB_ICONWARNING);
+    }
+    false
+}
+
+/// The hotkey as shown to the user.
+fn hotkey_label() -> &'static str {
+    let a = app();
+    match &a.hotkey {
+        Some(h) => h.as_str(),
+        None => hotkey::DEFAULTS[0],
     }
 }
 
@@ -460,25 +523,33 @@ fn is_url(q: &str) -> bool {
 }
 
 /// Rebuilds the result rows from the query, the app list and the file
-/// results that have arrived so far. Order: a calculation, apps, files, and
-/// last a web search.
+/// results that have arrived so far, in sections: a calculation, apps,
+/// files, and last a web search.
 fn rebuild_rows() {
     let a = app();
     let q = a.query.trim();
     let mut rows = Vec::new();
     if let Some(cmd) = q.strip_prefix('>') {
+        rows.push(Row::Header("Command"));
         rows.push(Row::Command(cmd.trim().to_string()));
     } else if q.is_empty() {
-        for id in a.history.recent() {
-            if let Some(idx) = a.apps.iter().position(|x| x.id == id) {
-                rows.push(Row::App { idx, positions: Vec::new() });
-                if rows.len() == MAX_RECENT {
-                    break;
-                }
-            }
+        let recent: Vec<usize> = a
+            .history
+            .recent()
+            .into_iter()
+            .filter_map(|id| a.apps.iter().position(|x| x.id == id))
+            .take(MAX_RECENT)
+            .collect();
+        if recent.is_empty() {
+            rows.push(Row::Header("Try"));
+            rows.extend((0..TIPS.len()).map(Row::Tip));
+        } else {
+            rows.push(Row::Header("Recent"));
+            rows.extend(recent.into_iter().map(|idx| Row::App { idx, positions: Vec::new() }));
         }
     } else {
         if let Some(v) = calc::eval(q) {
+            rows.push(Row::Header("Calculator"));
             rows.push(Row::Calc(v));
         }
         let mut scored: Vec<(i32, usize, Vec<usize>)> = a
@@ -488,11 +559,22 @@ fn rebuild_rows() {
             .filter_map(|(i, x)| fuzzy::score(&x.name, q).map(|m| (m.score + a.history.boost(&x.id), i, m.positions)))
             .collect();
         scored.sort_by(|x, y| y.0.cmp(&x.0).then(a.apps[x.1].name.len().cmp(&a.apps[y.1].name.len())));
-        rows.extend(scored.into_iter().take(MAX_APPS).map(|(_, idx, positions)| Row::App { idx, positions }));
-        rows.extend((0..a.files.len()).map(Row::File));
+        if !scored.is_empty() {
+            rows.push(Row::Header("Apps"));
+            rows.extend(scored.into_iter().take(MAX_APPS).map(|(_, idx, positions)| Row::App { idx, positions }));
+        }
+        if !a.files.is_empty() {
+            rows.push(Row::Header("Files"));
+            rows.extend((0..a.files.len()).map(Row::File));
+        }
+        rows.push(Row::Header("Web"));
         rows.push(Row::Web(q.to_string()));
     }
     a.rows = rows;
+}
+
+fn first_selectable() -> i32 {
+    app().rows.iter().position(Row::selectable).map_or(0, |i| i as i32)
 }
 
 unsafe fn on_text_changed() {
@@ -513,7 +595,7 @@ unsafe fn on_text_changed() {
         a.latest_id = a.latest_id.wrapping_add(1).max(1); // drop in-flight replies
     }
     rebuild_rows();
-    a.sel = 0;
+    a.sel = first_selectable();
     a.scroll = 0;
     a.hover = -1;
     relayout();
@@ -523,12 +605,13 @@ unsafe fn on_files(payload: &[u8]) {
     let a = app();
     let Some(list) = ipc::decode_list2(payload) else { return };
     let on_web = matches!(a.rows.get(a.sel as usize), Some(Row::Web(_)));
-    let profile = std::env::var("USERPROFILE").unwrap_or_default();
-    a.files = files::rank(list.items, a.query.trim(), &profile);
+    a.files = files::rank(list.items, a.query.trim(), &a.profile);
     a.file_status = FileStatus::Ready;
     rebuild_rows();
     if on_web {
         a.sel = a.rows.len() as i32 - 1; // the web row moved down
+    } else if !a.rows.get(a.sel as usize).is_some_and(Row::selectable) {
+        a.sel = first_selectable();
     }
     a.sel = a.sel.clamp(0, (a.rows.len() as i32 - 1).max(0));
     relayout();
@@ -573,15 +656,18 @@ unsafe fn make_font(px: i32, weight: i32, face: &str) -> HFONT {
 unsafe fn rebuild_fonts() {
     let a = app();
     if let Some(f) = a.fonts.take() {
-        for h in [f.edit, f.name, f.name_bold, f.small, f.glyph, f.glyph_big] {
+        for h in [f.edit, f.name, f.name_bold, f.result, f.small, f.header, f.key, f.glyph, f.glyph_big] {
             DeleteObject(h);
         }
     }
     a.fonts = Some(Fonts {
-        edit: make_font(20, 400, "Segoe UI"),
+        edit: make_font(21, 400, "Segoe UI"),
         name: make_font(15, 400, "Segoe UI"),
-        name_bold: make_font(15, 700, "Segoe UI"),
+        name_bold: make_font(15, 600, "Segoe UI"),
+        result: make_font(20, 600, "Segoe UI"),
         small: make_font(12, 400, "Segoe UI"),
+        header: make_font(12, 600, "Segoe UI"),
+        key: make_font(11, 400, "Segoe UI"),
         glyph: make_font(18, 400, "Segoe MDL2 Assets"),
         glyph_big: make_font(22, 400, "Segoe MDL2 Assets"),
     });
@@ -590,6 +676,18 @@ unsafe fn rebuild_fonts() {
     for (_, bmp) in a.app_icons.drain() {
         DeleteObject(bmp);
     }
+}
+
+/// Width of the hotkey keycap shown at the right of the empty box.
+unsafe fn hotkey_cap_width() -> i32 {
+    let a = app();
+    let Some(f) = &a.fonts else { return 0 };
+    let dc = GetDC(null_mut());
+    let old = SelectObject(dc, f.key);
+    let w = text_width(dc, hotkey_label()) + scale(16);
+    SelectObject(dc, old);
+    ReleaseDC(null_mut(), dc);
+    w
 }
 
 /// Centres the box horizontally on the monitor under the mouse, a fifth of
@@ -623,32 +721,54 @@ unsafe fn place_window() {
     SelectObject(dc, old);
     ReleaseDC(a.edit, dc);
     let eh = tm.tmHeight + scale(2);
-    let left = scale(52);
-    SetWindowPos(a.edit, null_mut(), left, (scale(BOX_H) - eh) / 2, w - left - scale(16), eh, SWP_NOZORDER | SWP_NOACTIVATE);
+    let left = scale(54);
+    let right = scale(20) + hotkey_cap_width() + scale(12);
+    SetWindowPos(a.edit, null_mut(), left, (scale(BOX_H) - eh) / 2, w - left - right, eh, SWP_NOZORDER | SWP_NOACTIVATE);
     SendMessageW(a.edit, EM_SETMARGINS, 3, 0);
     style_frame(a.hwnd);
 }
 
-fn visible_rows() -> i32 {
-    (app().rows.len() as i32).min(VISIBLE_ROWS)
+/// Total height of all rows.
+fn content_height() -> i32 {
+    app().rows.iter().map(Row::height).sum()
 }
 
+/// Height of the visible part of the list: everything if it fits, else as
+/// many whole rows as fit, so the last one isn't cut in half.
+fn view_height() -> i32 {
+    let max = scale(LIST_MAX_H);
+    let mut h = 0;
+    for row in &app().rows {
+        if h + row.height() > max {
+            break;
+        }
+        h += row.height();
+    }
+    h
+}
+
+/// Top of row `i` within the list content.
+fn row_top(i: usize) -> i32 {
+    app().rows[..i].iter().map(Row::height).sum()
+}
+
+/// Window y of the list content's top edge, before scrolling.
 fn list_top() -> i32 {
-    scale(BOX_H) + 1
+    scale(BOX_H) + 1 + scale(PAD)
 }
 
 fn window_height() -> i32 {
-    let n = visible_rows();
-    if n == 0 {
+    if app().rows.is_empty() {
         scale(BOX_H)
     } else {
-        list_top() + scale(PAD) * 2 + n * scale(ROW_H) + scale(FOOTER_H)
+        list_top() + view_height() + scale(PAD) + scale(FOOTER_H)
     }
 }
 
 /// Resizes the window for the current rows, keeping its top edge fixed.
 unsafe fn relayout() {
     let a = app();
+    a.scroll = a.scroll.clamp(0, (content_height() - view_height()).max(0));
     let mut rc: RECT = zeroed();
     GetWindowRect(a.hwnd, &mut rc);
     let h = window_height();
@@ -669,18 +789,44 @@ fn edit_text() -> String {
     }
 }
 
-unsafe fn move_selection(delta: i32) {
+/// Scrolls so row `i` is in view. A section's first row brings its header
+/// along.
+fn ensure_visible(i: usize) {
+    let a = app();
+    let mut top = row_top(i);
+    if i > 0 && !a.rows[i - 1].selectable() {
+        top -= a.rows[i - 1].height();
+    }
+    let bottom = row_top(i) + a.rows[i].height();
+    let view = view_height();
+    if top < a.scroll {
+        a.scroll = top;
+    } else if bottom > a.scroll + view {
+        a.scroll = bottom - view;
+    }
+}
+
+/// Moves the selection by `steps` selectable rows, skipping headers.
+unsafe fn move_selection(steps: i32) {
     let a = app();
     let n = a.rows.len() as i32;
     if n == 0 {
         return;
     }
-    a.sel = (a.sel + delta).clamp(0, n - 1);
-    if a.sel < a.scroll {
-        a.scroll = a.sel;
-    } else if a.sel >= a.scroll + VISIBLE_ROWS {
-        a.scroll = a.sel - VISIBLE_ROWS + 1;
+    let dir = steps.signum();
+    let mut i = a.sel;
+    for _ in 0..steps.abs() {
+        let mut j = i + dir;
+        while j >= 0 && j < n && !a.rows[j as usize].selectable() {
+            j += dir;
+        }
+        if j < 0 || j >= n {
+            break;
+        }
+        i = j;
     }
+    a.sel = i;
+    ensure_visible(i as usize);
     InvalidateRect(a.hwnd, null(), 0);
 }
 
@@ -730,6 +876,15 @@ unsafe fn open_row(index: i32, ctrl: bool, shift: bool) {
     let admin = ctrl && shift;
     let verb = admin.then_some("runas");
     match row {
+        Row::Header(_) => {}
+        Row::Tip(i) => {
+            // Type the example in; the search runs and shows what it does.
+            let example = TIPS[*i].0;
+            SetWindowTextW(a.edit, wide(example).as_ptr());
+            let end = example.encode_utf16().count();
+            SendMessageW(a.edit, EM_SETSEL, end, end as isize);
+            SetFocus(a.edit);
+        }
         Row::Calc(v) => {
             set_clipboard(&calc::plain(*v));
             dismiss();
@@ -762,7 +917,7 @@ unsafe fn open_row(index: i32, ctrl: bool, shift: bool) {
             }
             let args = format!("/k {cmd}");
             dismiss();
-            let home = std::env::var("USERPROFILE").ok();
+            let home = (!a.profile.is_empty()).then(|| a.profile.clone());
             shell_open(verb, "cmd.exe", Some(&args), home.as_deref());
         }
         Row::Web(q) => {
@@ -805,7 +960,7 @@ unsafe fn activate() {
     // Recent apps may have changed since the box was last open.
     if a.query.trim().is_empty() {
         rebuild_rows();
-        a.sel = 0;
+        a.sel = first_selectable();
         a.scroll = 0;
     }
     place_window(); // the mouse, monitor or DPI may have changed while hidden
@@ -849,11 +1004,11 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     true
                 }
                 VK_NEXT => {
-                    move_selection(VISIBLE_ROWS);
+                    move_selection(6);
                     true
                 }
                 VK_PRIOR => {
-                    move_selection(-VISIBLE_ROWS);
+                    move_selection(-6);
                     true
                 }
                 VK_RETURN => {
@@ -919,19 +1074,23 @@ unsafe fn show_menu(hwnd: HWND) {
     DestroyMenu(menu);
 }
 
+/// The selectable row under window y, or -1.
 fn row_at(y: i32) -> i32 {
     let a = app();
-    let top = list_top() + scale(PAD);
-    if y < top {
+    let top = list_top();
+    if y < top || y >= top + view_height() {
         return -1;
     }
-    let r = (y - top) / scale(ROW_H);
-    let i = a.scroll + r;
-    if r < visible_rows() && i < a.rows.len() as i32 {
-        i
-    } else {
-        -1
+    let cy = y - top + a.scroll;
+    let mut acc = 0;
+    for (i, row) in a.rows.iter().enumerate() {
+        let h = row.height();
+        if cy < acc + h {
+            return if row.selectable() { i as i32 } else { -1 };
+        }
+        acc += h;
     }
+    -1
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -949,6 +1108,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 a.files.clear();
                 a.file_status = FileStatus::NotRunning;
                 rebuild_rows();
+                if !a.rows.get(a.sel as usize).is_some_and(Row::selectable) {
+                    a.sel = first_selectable();
+                }
+                a.sel = a.sel.clamp(0, (a.rows.len() as i32 - 1).max(0));
                 relayout();
                 if a.render.is_some() {
                     render_and_quit();
@@ -961,9 +1124,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             a.indexing = false;
             a.indexed_at = Some(Instant::now());
             a.apps = *list;
-            let sel = a.sel;
             rebuild_rows();
-            a.sel = sel.clamp(0, (a.rows.len() as i32 - 1).max(0));
+            if !a.rows.get(a.sel as usize).is_some_and(Row::selectable) {
+                a.sel = first_selectable();
+            }
+            a.sel = a.sel.clamp(0, (a.rows.len() as i32 - 1).max(0));
             relayout();
             0
         }
@@ -1040,8 +1205,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
-            let max_scroll = (a.rows.len() as i32 - VISIBLE_ROWS).max(0);
-            a.scroll = (a.scroll - delta.signum() * 3).clamp(0, max_scroll);
+            let max_scroll = (content_height() - view_height()).max(0);
+            a.scroll = (a.scroll - delta * scale(ROW_H) * 2 / 120).clamp(0, max_scroll);
+            a.hover = -1;
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1088,38 +1254,52 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-/// System image list index for a file's icon, by extension. Uses
+/// System image list index for a file's icon. Programs, shortcuts and icon
+/// files have icons of their own, read from the file (only for rows on
+/// screen). Everything else gets its type's icon by extension, with
 /// SHGFI_USEFILEATTRIBUTES so the shell never opens the file.
 unsafe fn file_icon(item: &Item) -> i32 {
     let a = app();
-    let key = if item.is_folder() {
-        "<folder>".to_string()
-    } else {
-        match item.name.rfind('.') {
-            Some(i) => item.name[i..].to_lowercase(),
-            None => "<file>".to_string(),
-        }
+    let ext = match item.name.rfind('.') {
+        Some(i) if !item.is_folder() => item.name[i..].to_lowercase(),
+        _ => String::new(),
     };
-    if let Some(&i) = a.ext_icons.get(&key) {
+    let own = matches!(ext.as_str(), ".exe" | ".lnk" | ".url" | ".ico" | ".appref-ms");
+    let key = if own {
+        item.full_path()
+    } else if item.is_folder() {
+        "<folder>".to_string()
+    } else if ext.is_empty() {
+        "<file>".to_string()
+    } else {
+        ext.clone()
+    };
+    if let Some(&i) = a.file_icons.get(&key) {
         return i;
     }
-    let (probe, attrs) = if item.is_folder() {
-        ("folder".to_string(), FILE_ATTRIBUTE_DIRECTORY)
-    } else {
-        (format!("file{}", if key.starts_with('.') { &key } else { "" }), FILE_ATTRIBUTE_NORMAL)
-    };
     let mut sfi: SHFILEINFOW = zeroed();
-    let himl = SHGetFileInfoW(
-        wide(&probe).as_ptr(),
-        attrs,
-        &mut sfi,
-        size_of::<SHFILEINFOW>() as u32,
-        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_LARGEICON,
-    );
+    let mut himl = 0;
+    if own {
+        himl = SHGetFileInfoW(wide(&key).as_ptr(), 0, &mut sfi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
+    }
+    if himl == 0 {
+        let (probe, attrs) = if item.is_folder() {
+            ("folder".to_string(), FILE_ATTRIBUTE_DIRECTORY)
+        } else {
+            (format!("file{ext}"), FILE_ATTRIBUTE_NORMAL)
+        };
+        himl = SHGetFileInfoW(
+            wide(&probe).as_ptr(),
+            attrs,
+            &mut sfi,
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_LARGEICON,
+        );
+    }
     if himl != 0 {
         a.image_list = himl as isize;
     }
-    a.ext_icons.insert(key, sfi.iIcon);
+    a.file_icons.insert(key, sfi.iIcon);
     sfi.iIcon
 }
 
@@ -1172,8 +1352,38 @@ unsafe fn draw_glyph(dc: HDC, font: HFONT, glyph: u16, color: COLORREF, mut rc: 
     DrawTextW(dc, [glyph].as_ptr(), 1, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
-/// Draws `(text, matched)` runs on one line, matched runs bold in the accent
-/// colour; the run that overflows ends the line with an ellipsis.
+unsafe fn fill_round(dc: HDC, rc: RECT, radius: i32, fill: COLORREF, edge: Option<COLORREF>) {
+    let brush = CreateSolidBrush(fill);
+    let pen = match edge {
+        Some(c) => CreatePen(PS_SOLID, 1, c),
+        None => GetStockObject(NULL_PEN) as HPEN,
+    };
+    let (ob, op) = (SelectObject(dc, brush), SelectObject(dc, pen));
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(brush);
+    if edge.is_some() {
+        DeleteObject(pen);
+    }
+}
+
+/// Draws a keyboard key label like `[Enter]` with its left edge at `x`,
+/// vertically centred on `cy`, and returns its width.
+unsafe fn draw_keycap(dc: HDC, f: &Fonts, t: Theme, label: &str, x: i32, cy: i32) -> i32 {
+    SelectObject(dc, f.key);
+    let w = text_width(dc, label) + scale(12);
+    let h = scale(KEYCAP_H);
+    let rc = RECT { left: x, top: cy - h / 2, right: x + w, bottom: cy - h / 2 + h };
+    fill_round(dc, rc, scale(6), t.key, Some(t.border));
+    SetTextColor(dc, t.dim);
+    let mut tr = rc;
+    draw_text(dc, label, &mut tr, DT_CENTER | DT_VCENTER);
+    w
+}
+
+/// Draws `(text, matched)` runs on one line, matched runs semibold in the
+/// accent colour; the run that overflows ends the line with an ellipsis.
 unsafe fn draw_runs(dc: HDC, f: &Fonts, t: Theme, runs: &[(String, bool)], mut x: i32, top: i32, right: i32, bottom: i32) {
     for (run, hit) in runs {
         SelectObject(dc, if *hit { f.name_bold } else { f.name });
@@ -1193,19 +1403,22 @@ fn describe(row: &Row) -> (Vec<(String, bool)>, String, &'static str) {
     let a = app();
     let plain = |s: String| vec![(s, false)];
     match row {
-        Row::Calc(v) => (vec![(format!("= {}", calc::pretty(*v)), true)], format!("{}  ·  Enter copies the result", a.query.trim()), "Copy"),
+        Row::Header(h) => (plain(h.to_string()), String::new(), ""),
+        Row::Tip(i) => (plain(TIPS[*i].0.to_string()), TIPS[*i].1.to_string(), "Try"),
+        Row::Calc(v) => (vec![(calc::pretty(*v), true)], format!("{} =", a.query.trim()), "Copy"),
         Row::App { idx, positions } => {
             let e = &a.apps[*idx];
             let sub = match &e.path {
-                Some(p) => p.clone(),
+                Some(p) => files::tilde(p, &a.profile),
                 None if e.id.starts_with("http") => e.id.clone(),
+                None if e.is_packaged() => "Windows app".to_string(),
                 None => "App".to_string(),
             };
             (fuzzy::runs(&e.name, positions), sub, "Open")
         }
         Row::File(i) => {
             let item = &a.files[*i];
-            (highlight::segments(item.highlighted_name.as_deref().unwrap_or(&item.name)), item.path.clone(), "Open")
+            (highlight::segments(item.highlighted_name.as_deref().unwrap_or(&item.name)), files::tilde(&item.path, &a.profile), "Open")
         }
         Row::Command(cmd) if cmd.is_empty() => (plain("Type a command to run".into()), "For example: > ipconfig /all".into(), ""),
         Row::Command(cmd) => (plain(cmd.clone()), "Run in Command Prompt".into(), "Run"),
@@ -1214,18 +1427,31 @@ fn describe(row: &Row) -> (Vec<(String, bool)>, String, &'static str) {
     }
 }
 
-/// Footer key hints for the selected row.
-fn hints(row: Option<&Row>) -> &'static str {
+/// Footer key hints for the selected row: (key, what it does).
+fn hints(row: Option<&Row>) -> Vec<(&'static str, &'static str)> {
+    let mut h = vec![("\u{2191}\u{2193}", "Select")];
     match row {
-        Some(Row::Calc(_)) => "Enter copy   Esc close",
-        Some(Row::App { idx, .. }) if app().apps[*idx].path.is_some() => {
-            "Enter open   Ctrl+Enter file location   Ctrl+Shift+Enter as admin"
+        Some(Row::Tip(_)) => h.push(("Enter", "Try it")),
+        Some(Row::Calc(_)) => h.push(("Enter", "Copy")),
+        Some(Row::App { idx, .. }) => {
+            h.push(("Enter", "Open"));
+            if app().apps[*idx].path.is_some() {
+                h.push(("Ctrl+Enter", "File location"));
+            }
+            h.push(("Ctrl+Shift+Enter", "Admin"));
         }
-        Some(Row::App { .. }) => "Enter open   Ctrl+Shift+Enter as admin   Esc close",
-        Some(Row::File(_)) => "Enter open   Ctrl+Enter show in folder   Esc close",
-        Some(Row::Command(_)) => "Enter run   Ctrl+Shift+Enter as admin   Esc close",
-        _ => "Enter open   Esc close",
+        Some(Row::File(_)) => {
+            h.push(("Enter", "Open"));
+            h.push(("Ctrl+Enter", "Show in folder"));
+        }
+        Some(Row::Command(_)) => {
+            h.push(("Enter", "Run"));
+            h.push(("Ctrl+Shift+Enter", "Admin"));
+        }
+        _ => h.push(("Enter", "Open")),
     }
+    h.push(("Esc", "Close"));
+    h
 }
 
 /// Double-buffered paint of the box, the rows and the footer.
@@ -1242,38 +1468,57 @@ unsafe fn paint(hwnd: HWND, target: HDC) {
     FillRect(dc, &rc, a.bg_brush);
     SetBkMode(dc, TRANSPARENT as _);
 
+    // The box: magnifier (accent once something is typed) and, while empty,
+    // the hotkey as a keycap on the right.
     let box_h = scale(BOX_H);
-    draw_glyph(dc, f.glyph, GLYPH_SEARCH, t.dim, RECT { left: scale(14), top: 0, right: scale(44), bottom: box_h });
+    let typed = !a.query.is_empty();
+    draw_glyph(dc, f.glyph, GLYPH_SEARCH, if typed { t.accent } else { t.dim }, RECT { left: scale(16), top: 0, right: scale(46), bottom: box_h });
+    if !typed {
+        let cw = hotkey_cap_width();
+        draw_keycap(dc, f, t, hotkey_label(), w - scale(20) - cw, box_h / 2);
+    }
 
     if !a.rows.is_empty() {
         let line = CreateSolidBrush(t.border);
         FillRect(dc, &RECT { left: 0, top: box_h, right: w, bottom: box_h + 1 }, line);
         DeleteObject(line);
 
-        let (pad, row_h, icon) = (scale(PAD), scale(ROW_H), scale(ICON));
+        let (pad, icon) = (scale(PAD), scale(ICON));
         let text_x = pad + scale(14) + icon + scale(14);
-        let sel_brush = CreateSolidBrush(t.sel);
-        let accent_brush = CreateSolidBrush(t.accent);
-        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-        for r in 0..visible_rows() {
-            let i = a.scroll + r;
-            let Some(row) = a.rows.get(i as usize) else { break };
-            let top = list_top() + pad + r * row_h;
-            let bottom = top + row_h;
+        let (view_top, view_h) = (list_top(), view_height());
+        let content = content_height();
+        let scrollable = content > view_h;
+        let row_right = w - pad - if scrollable { scale(8) } else { 0 };
+
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, 0, view_top, w, view_top + view_h);
+        let mut y = view_top - a.scroll;
+        for (i, row) in a.rows.iter().enumerate() {
+            let rh = row.height();
+            let (top, bottom) = (y, y + rh);
+            y += rh;
+            if bottom <= view_top || top >= view_top + view_h {
+                continue;
+            }
+            let i = i as i32;
+            if let Row::Header(label) = row {
+                SelectObject(dc, f.header);
+                SetTextColor(dc, t.dim);
+                let mut hr = RECT { left: pad + scale(14), top, right: row_right, bottom: bottom - scale(5) };
+                draw_text(dc, label, &mut hr, DT_LEFT | DT_BOTTOM);
+                continue;
+            }
             if i == a.sel || i == a.hover {
-                let old = SelectObject(dc, sel_brush);
-                RoundRect(dc, pad, top, w - pad, bottom, scale(8), scale(8));
-                SelectObject(dc, old);
+                let fill = if i == a.sel { t.sel } else { t.hover };
+                fill_round(dc, RECT { left: pad, top, right: row_right, bottom }, scale(8), fill, None);
             }
             if i == a.sel {
                 // Windows 11 style selection pill.
-                let old = SelectObject(dc, accent_brush);
-                RoundRect(dc, pad + scale(2), top + scale(16), pad + scale(5), bottom - scale(16), scale(3), scale(3));
-                SelectObject(dc, old);
+                fill_round(dc, RECT { left: pad + scale(1), top: top + scale(15), right: pad + scale(4), bottom: bottom - scale(15) }, scale(3), t.accent, None);
             }
 
             let ix = pad + scale(14);
-            let iy = top + (row_h - icon) / 2;
+            let iy = top + (rh - icon) / 2;
             let glyph_rc = RECT { left: ix, top, right: ix + icon, bottom };
             match row {
                 Row::App { idx, .. } => {
@@ -1288,50 +1533,91 @@ unsafe fn paint(hwnd: HWND, target: HDC) {
                     let idx = file_icon(&a.files[*fi]);
                     if a.image_list != 0 {
                         let sys = GetSystemMetrics(SM_CXICON);
-                        ImageList_Draw(a.image_list as _, idx, dc, ix + (icon - sys) / 2, top + (row_h - sys) / 2, ILD_TRANSPARENT);
+                        ImageList_Draw(a.image_list as _, idx, dc, ix + (icon - sys) / 2, top + (rh - sys) / 2, ILD_TRANSPARENT);
                     }
                 }
+                Row::Tip(_) => draw_glyph(dc, f.glyph_big, GLYPH_BULB, t.accent, glyph_rc),
                 Row::Calc(_) => draw_glyph(dc, f.glyph_big, GLYPH_CALC, t.accent, glyph_rc),
                 Row::Command(_) => draw_glyph(dc, f.glyph_big, GLYPH_COMMAND, t.accent, glyph_rc),
                 Row::Web(_) => draw_glyph(dc, f.glyph_big, GLYPH_GLOBE, t.accent, glyph_rc),
+                Row::Header(_) => {}
             }
 
             let (title, sub, action) = describe(row);
-            let mut text_right = w - pad - scale(14);
+            let mut text_right = row_right - scale(14);
             if i == a.sel && !action.is_empty() {
+                // "Open [Enter]" on the right of the selected row.
+                SelectObject(dc, f.key);
+                let cap_w = text_width(dc, "Enter") + scale(12);
+                draw_keycap(dc, f, t, "Enter", text_right - cap_w, (top + bottom) / 2);
                 SelectObject(dc, f.small);
                 SetTextColor(dc, t.dim);
-                let label = format!("{action}  \u{21B5}");
-                let lw = text_width(dc, &label);
-                let mut ar = RECT { left: text_right - lw, top, right: text_right, bottom };
-                draw_text(dc, &label, &mut ar, DT_RIGHT | DT_VCENTER);
-                text_right -= lw + scale(16);
+                let lw = text_width(dc, action);
+                let mut ar = RECT { left: text_right - cap_w - scale(6) - lw, top, right: text_right - cap_w - scale(6), bottom };
+                draw_text(dc, action, &mut ar, DT_RIGHT | DT_VCENTER);
+                text_right -= cap_w + lw + scale(22);
             }
-            let name_bottom = top + row_h / 2 + scale(3);
-            draw_runs(dc, f, t, &title, text_x, top + scale(4), text_right, name_bottom);
+            let name_bottom = top + rh / 2 + scale(3);
+            if let Row::Calc(_) = row {
+                // The result, large.
+                SelectObject(dc, f.result);
+                SetTextColor(dc, t.text);
+                let mut r = RECT { left: text_x, top: top + scale(2), right: text_right, bottom: name_bottom + scale(2) };
+                draw_text(dc, &title[0].0, &mut r, DT_LEFT | DT_BOTTOM | DT_END_ELLIPSIS);
+            } else {
+                draw_runs(dc, f, t, &title, text_x, top + scale(4), text_right, name_bottom);
+            }
             SelectObject(dc, f.small);
             SetTextColor(dc, t.dim);
             let mut sr = RECT { left: text_x, top: name_bottom + scale(1), right: text_right, bottom: bottom - scale(3) };
             draw_text(dc, &sub, &mut sr, DT_LEFT | DT_TOP | DT_PATH_ELLIPSIS | DT_END_ELLIPSIS);
         }
-        SelectObject(dc, old_pen);
-        DeleteObject(sel_brush);
-        DeleteObject(accent_brush);
+        RestoreDC(dc, saved);
 
-        // Footer: key hints, and file search status on the right.
+        if scrollable {
+            // A thin scrollbar thumb.
+            let track = view_h - scale(8);
+            let thumb = (track * view_h / content).max(scale(24));
+            let ty = view_top + scale(4) + (track - thumb) * a.scroll / (content - view_h);
+            fill_round(dc, RECT { left: w - scale(8), top: ty, right: w - scale(5), bottom: ty + thumb }, scale(3), t.border, None);
+        }
+
+        // Footer: a divider, key hints as keycaps, status on the right.
+        let fy = h - scale(FOOTER_H);
+        let line = CreateSolidBrush(t.border);
+        FillRect(dc, &RECT { left: 0, top: fy, right: w, bottom: fy + 1 }, line);
+        DeleteObject(line);
+        let cy = fy + scale(FOOTER_H) / 2;
         SelectObject(dc, f.small);
-        SetTextColor(dc, t.dim);
-        let mut fr = RECT { left: pad + scale(14), top: h - scale(FOOTER_H), right: w - pad - scale(14), bottom: h - scale(4) };
         let status = match a.file_status {
             FileStatus::NotRunning => "Everything isn't running: no file results".to_string(),
-            _ if a.query.trim().is_empty() => "Recent".to_string(),
-            _ if a.rows.len() as i32 > VISIBLE_ROWS => format!("{} results", a.rows.len()),
+            _ if a.rows.iter().filter(|r| r.selectable()).count() > 8 => {
+                format!("{} results", a.rows.iter().filter(|r| r.selectable()).count())
+            }
             _ => String::new(),
         };
         let status_w = if status.is_empty() { 0 } else { text_width(dc, &status) + scale(16) };
-        let mut hr = RECT { right: fr.right - status_w, ..fr };
-        draw_text(dc, hints(a.rows.get(a.sel as usize)), &mut hr, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-        draw_text(dc, &status, &mut fr, DT_RIGHT | DT_VCENTER);
+        let limit = w - scale(16) - status_w;
+        let mut x = scale(16);
+        for (key, what) in hints(a.rows.get(a.sel as usize)) {
+            SelectObject(dc, f.key);
+            let need = text_width(dc, key) + scale(12) + scale(6);
+            SelectObject(dc, f.small);
+            let need = need + text_width(dc, what) + scale(16);
+            if x + need > limit {
+                break;
+            }
+            x += draw_keycap(dc, f, t, key, x, cy) + scale(6);
+            SelectObject(dc, f.small);
+            SetTextColor(dc, t.dim);
+            let mut r = RECT { left: x, top: fy, right: limit, bottom: h };
+            draw_text(dc, what, &mut r, DT_LEFT | DT_VCENTER);
+            x += text_width(dc, what) + scale(16);
+        }
+        SelectObject(dc, f.small);
+        SetTextColor(dc, t.dim);
+        let mut sr = RECT { left: limit, top: fy, right: w - scale(16), bottom: h };
+        draw_text(dc, &status, &mut sr, DT_RIGHT | DT_VCENTER);
     }
 
     BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY);
@@ -1394,7 +1680,11 @@ unsafe fn render_and_quit() {
     for row in &a.rows {
         let (title, sub, _) = describe(row);
         let title: String = title.iter().map(|(s, hit)| if *hit { format!("[{s}]") } else { s.clone() }).collect();
-        summary.push_str(&format!("{title} | {sub}\n"));
+        if row.selectable() {
+            summary.push_str(&format!("  {title} | {sub}\n"));
+        } else {
+            summary.push_str(&format!("# {title}\n"));
+        }
     }
     let _ = std::fs::write(format!("{}.txt", job.out), summary);
     DeleteObject(bmp);

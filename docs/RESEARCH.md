@@ -27,7 +27,7 @@ Install size: 197 MB unpacked (the .NET runtime, WPF, and 12 bundled plugins).
   `ActivateKeyboardLayout`, `UnloadKeyboardLayout` (it can switch to an English layout while you type
   a query).
 
-**hop:** `RegisterHotKey` only, default Alt+Space. No Win-key-alone hotkeys, so no keyboard hook runs
+**hop:** `RegisterHotKey` only, default `` Win+` `` (with fallbacks if it's taken). No Win-key-alone hotkeys, so no keyboard hook runs
 on every key press system-wide.
 
 ## Finding apps

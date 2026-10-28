@@ -80,11 +80,35 @@ pub fn rank(mut items: Vec<Item>, typed: &str, profile: &str) -> Vec<Item> {
     items
 }
 
+/// Shows a path under the user profile as `~\...`, which is shorter and
+/// keeps the part that differs visible.
+pub fn tilde(path: &str, profile: &str) -> String {
+    let profile = profile.trim_end_matches('\\');
+    if profile.is_empty() || path.len() < profile.len() || !path.is_char_boundary(profile.len()) {
+        return path.to_string();
+    }
+    let (head, rest) = path.split_at(profile.len());
+    if head.eq_ignore_ascii_case(profile) && (rest.is_empty() || rest.starts_with('\\')) {
+        format!("~{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const HOME: &str = "C:\\Users\\me";
+
+    #[test]
+    fn tilde_shortens_only_the_profile() {
+        assert_eq!(tilde("C:\\Users\\me\\Downloads", HOME), "~\\Downloads");
+        assert_eq!(tilde("c:\\users\\ME", HOME), "~");
+        assert_eq!(tilde("C:\\Users\\meg\\x", HOME), "C:\\Users\\meg\\x");
+        assert_eq!(tilde("D:\\work", HOME), "D:\\work");
+        assert_eq!(tilde("C:\\Users\\me\\x", ""), "C:\\Users\\me\\x");
+    }
 
     #[test]
     fn appends_exclusions() {
